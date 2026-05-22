@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import EventKit
 import UniformTypeIdentifiers
 
 // MARK: - Models
@@ -8,6 +9,17 @@ struct Subtask: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
     var title: String
     var done: Bool = false
+
+    enum CodingKeys: String, CodingKey { case id, title, done }
+    init(id: UUID = UUID(), title: String, done: Bool = false) {
+        self.id = id; self.title = title; self.done = done
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
+        title = (try? c.decode(String.self, forKey: .title)) ?? ""
+        done = (try? c.decode(Bool.self, forKey: .done)) ?? false
+    }
 }
 
 struct TodoTask: Identifiable, Codable, Hashable {
@@ -16,10 +28,36 @@ struct TodoTask: Identifiable, Codable, Hashable {
     var notes: String = ""
     var createdAt: Date = Date()
     var subtasks: [Subtask] = []
+    var dueDate: Date? = nil
+    var calendarEventID: String? = nil
+    var reminderID: String? = nil
 
     var canComplete: Bool { subtasks.allSatisfy { $0.done } }
     var subtaskProgress: (done: Int, total: Int) {
         (subtasks.filter { $0.done }.count, subtasks.count)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, notes, createdAt, subtasks, dueDate, calendarEventID, reminderID
+    }
+    init(id: UUID = UUID(), title: String, notes: String = "",
+         createdAt: Date = Date(), subtasks: [Subtask] = [],
+         dueDate: Date? = nil, calendarEventID: String? = nil, reminderID: String? = nil) {
+        self.id = id; self.title = title; self.notes = notes
+        self.createdAt = createdAt; self.subtasks = subtasks
+        self.dueDate = dueDate; self.calendarEventID = calendarEventID
+        self.reminderID = reminderID
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
+        title = (try? c.decode(String.self, forKey: .title)) ?? ""
+        notes = (try? c.decode(String.self, forKey: .notes)) ?? ""
+        createdAt = (try? c.decode(Date.self, forKey: .createdAt)) ?? Date()
+        subtasks = (try? c.decode([Subtask].self, forKey: .subtasks)) ?? []
+        dueDate = try? c.decode(Date.self, forKey: .dueDate)
+        calendarEventID = try? c.decode(String.self, forKey: .calendarEventID)
+        reminderID = try? c.decode(String.self, forKey: .reminderID)
     }
 }
 
@@ -30,6 +68,22 @@ struct CompletedTask: Identifiable, Codable, Hashable {
     var createdAt: Date
     var completedAt: Date = Date()
     var subtasks: [Subtask] = []
+
+    enum CodingKeys: String, CodingKey { case id, title, notes, createdAt, completedAt, subtasks }
+    init(id: UUID = UUID(), title: String, notes: String = "",
+         createdAt: Date, completedAt: Date = Date(), subtasks: [Subtask] = []) {
+        self.id = id; self.title = title; self.notes = notes
+        self.createdAt = createdAt; self.completedAt = completedAt; self.subtasks = subtasks
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
+        title = (try? c.decode(String.self, forKey: .title)) ?? ""
+        notes = (try? c.decode(String.self, forKey: .notes)) ?? ""
+        createdAt = (try? c.decode(Date.self, forKey: .createdAt)) ?? Date()
+        completedAt = (try? c.decode(Date.self, forKey: .completedAt)) ?? Date()
+        subtasks = (try? c.decode([Subtask].self, forKey: .subtasks)) ?? []
+    }
 }
 
 struct Category: Identifiable, Codable, Hashable {
@@ -37,10 +91,139 @@ struct Category: Identifiable, Codable, Hashable {
     var name: String
     var tasks: [TodoTask] = []
     var completed: [CompletedTask] = []
+
+    enum CodingKeys: String, CodingKey { case id, name, tasks, completed }
+    init(id: UUID = UUID(), name: String, tasks: [TodoTask] = [], completed: [CompletedTask] = []) {
+        self.id = id; self.name = name; self.tasks = tasks; self.completed = completed
+    }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(UUID.self, forKey: .id)) ?? UUID()
+        name = (try? c.decode(String.self, forKey: .name)) ?? "Untitled"
+        tasks = (try? c.decode([TodoTask].self, forKey: .tasks)) ?? []
+        completed = (try? c.decode([CompletedTask].self, forKey: .completed)) ?? []
+    }
+}
+
+// MARK: - Calendar / Reminders
+
+@MainActor
+final class CalendarSync {
+    static let shared = CalendarSync()
+    private let store = EKEventStore()
+    private(set) var eventsAuthorized = false
+    private(set) var remindersAuthorized = false
+
+    func requestPermissions() async {
+        if #available(macOS 14, *) {
+            eventsAuthorized = (try? await store.requestFullAccessToEvents()) ?? false
+            remindersAuthorized = (try? await store.requestFullAccessToReminders()) ?? false
+        } else {
+            eventsAuthorized = await withCheckedContinuation { cont in
+                store.requestAccess(to: .event) { ok, _ in cont.resume(returning: ok) }
+            }
+            remindersAuthorized = await withCheckedContinuation { cont in
+                store.requestAccess(to: .reminder) { ok, _ in cont.resume(returning: ok) }
+            }
+        }
+    }
+
+    /// Push task to Reminders (always) and Calendar (only if dueDate).
+    /// Returns updated (eventID, reminderID) which the caller persists onto the task.
+    @discardableResult
+    func upsert(task: TodoTask, categoryName: String) -> (event: String?, reminder: String?) {
+        var eventID = task.calendarEventID
+        var reminderID = task.reminderID
+        let titled = "[\(categoryName)] \(task.title)"
+
+        // Calendar event — only when a due date is set
+        if let due = task.dueDate, eventsAuthorized,
+           let cal = store.defaultCalendarForNewEvents {
+            let event: EKEvent
+            if let id = eventID, let existing = store.event(withIdentifier: id) {
+                event = existing
+            } else {
+                event = EKEvent(eventStore: store)
+                event.calendar = cal
+            }
+            event.title = titled
+            event.notes = task.notes.isEmpty ? nil : task.notes
+            event.startDate = due
+            event.endDate = due.addingTimeInterval(30 * 60)
+            event.isAllDay = false
+            do {
+                try store.save(event, span: .thisEvent, commit: true)
+                eventID = event.eventIdentifier
+            } catch {
+                NSLog("QueueDo: calendar save failed: \(error)")
+            }
+        } else if let id = eventID, let existing = store.event(withIdentifier: id) {
+            try? store.remove(existing, span: .thisEvent, commit: true)
+            eventID = nil
+        }
+
+        // Reminder — always (whether or not dueDate is set)
+        if remindersAuthorized, let cal = store.defaultCalendarForNewReminders() {
+            let reminder: EKReminder
+            if let id = reminderID,
+               let existing = store.calendarItem(withIdentifier: id) as? EKReminder {
+                reminder = existing
+            } else {
+                reminder = EKReminder(eventStore: store)
+                reminder.calendar = cal
+            }
+            reminder.title = titled
+            reminder.notes = task.notes.isEmpty ? nil : task.notes
+            if let due = task.dueDate {
+                reminder.dueDateComponents = Calendar.current.dateComponents(
+                    [.year, .month, .day, .hour, .minute], from: due)
+            } else {
+                reminder.dueDateComponents = nil
+            }
+            reminder.isCompleted = false
+            do {
+                try store.save(reminder, commit: true)
+                reminderID = reminder.calendarItemIdentifier
+            } catch {
+                NSLog("QueueDo: reminder save failed: \(error)")
+            }
+        }
+
+        return (eventID, reminderID)
+    }
+
+    func remove(eventID: String?, reminderID: String?) {
+        if let id = eventID, let event = store.event(withIdentifier: id) {
+            try? store.remove(event, span: .thisEvent, commit: true)
+        }
+        if let id = reminderID,
+           let reminder = store.calendarItem(withIdentifier: id) as? EKReminder {
+            try? store.remove(reminder, commit: true)
+        }
+    }
+
+    func markComplete(reminderID: String?, eventID: String?) {
+        if let id = reminderID,
+           let reminder = store.calendarItem(withIdentifier: id) as? EKReminder {
+            reminder.isCompleted = true
+            try? store.save(reminder, commit: true)
+        }
+        // Calendar event: leave in calendar for record-keeping; do not delete on complete.
+        _ = eventID
+    }
 }
 
 struct AppData: Codable {
     var categories: [Category] = []
+    var selectedCategoryID: UUID? = nil
+
+    enum CodingKeys: String, CodingKey { case categories, selectedCategoryID }
+    init() {}
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        categories = (try? c.decode([Category].self, forKey: .categories)) ?? []
+        selectedCategoryID = try? c.decode(UUID.self, forKey: .selectedCategoryID)
+    }
 }
 
 // MARK: - Store
@@ -48,9 +231,17 @@ struct AppData: Codable {
 @MainActor
 final class Store: ObservableObject {
     @Published var data: AppData = AppData()
-    @Published var selectedCategoryID: UUID?
 
     private let fileURL: URL
+
+    var selectedCategoryID: UUID? {
+        get { data.selectedCategoryID }
+        set { data.selectedCategoryID = newValue; save() }
+    }
+    var selectedCategoryBinding: Binding<UUID?> {
+        Binding(get: { self.data.selectedCategoryID },
+                set: { self.data.selectedCategoryID = $0; self.save() })
+    }
 
     init() {
         let fm = FileManager.default
@@ -64,12 +255,19 @@ final class Store: ObservableObject {
         if data.categories.isEmpty {
             data.categories = [
                 Category(name: "Work"),
-                Category(name: "RAship"),
-                Category(name: "Company"),
+                Category(name: "School"),
+                Category(name: "Personal"),
             ]
-            save()
         }
-        selectedCategoryID = data.categories.first?.id
+        // Validate selectedCategoryID (clear if stale, default to first)
+        if let sel = data.selectedCategoryID,
+           !data.categories.contains(where: { $0.id == sel }) {
+            data.selectedCategoryID = nil
+        }
+        if data.selectedCategoryID == nil {
+            data.selectedCategoryID = data.categories.first?.id
+        }
+        save()
     }
 
     func load() {
@@ -94,7 +292,7 @@ final class Store: ObservableObject {
     func addCategory(name: String) {
         let c = Category(name: name)
         data.categories.append(c)
-        selectedCategoryID = c.id
+        data.selectedCategoryID = c.id
         save()
     }
 
@@ -107,27 +305,38 @@ final class Store: ObservableObject {
 
     func deleteCategory(_ id: UUID) {
         data.categories.removeAll { $0.id == id }
-        if selectedCategoryID == id {
-            selectedCategoryID = data.categories.first?.id
+        if data.selectedCategoryID == id {
+            data.selectedCategoryID = data.categories.first?.id
         }
         save()
     }
 
     func addTask(to categoryID: UUID, title: String, notes: String) {
         guard let i = data.categories.firstIndex(where: { $0.id == categoryID }) else { return }
-        data.categories[i].tasks.append(TodoTask(title: title, notes: notes))
+        var task = TodoTask(title: title, notes: notes)
+        let ids = CalendarSync.shared.upsert(task: task, categoryName: data.categories[i].name)
+        task.calendarEventID = ids.event
+        task.reminderID = ids.reminder
+        data.categories[i].tasks.append(task)
         save()
     }
 
     func updateTask(_ task: TodoTask, in categoryID: UUID) {
         guard let i = data.categories.firstIndex(where: { $0.id == categoryID }),
               let j = data.categories[i].tasks.firstIndex(where: { $0.id == task.id }) else { return }
-        data.categories[i].tasks[j] = task
+        var updated = task
+        let ids = CalendarSync.shared.upsert(task: updated, categoryName: data.categories[i].name)
+        updated.calendarEventID = ids.event
+        updated.reminderID = ids.reminder
+        data.categories[i].tasks[j] = updated
         save()
     }
 
     func removeTask(_ taskID: UUID, in categoryID: UUID) {
         guard let i = data.categories.firstIndex(where: { $0.id == categoryID }) else { return }
+        if let task = data.categories[i].tasks.first(where: { $0.id == taskID }) {
+            CalendarSync.shared.remove(eventID: task.calendarEventID, reminderID: task.reminderID)
+        }
         data.categories[i].tasks.removeAll { $0.id == taskID }
         save()
     }
@@ -143,6 +352,7 @@ final class Store: ObservableObject {
               let j = data.categories[i].tasks.firstIndex(where: { $0.id == taskID }) else { return }
         guard data.categories[i].tasks[j].canComplete else { return }
         let t = data.categories[i].tasks.remove(at: j)
+        CalendarSync.shared.markComplete(reminderID: t.reminderID, eventID: t.calendarEventID)
         let done = CompletedTask(title: t.title, notes: t.notes,
                                  createdAt: t.createdAt, subtasks: t.subtasks)
         data.categories[i].completed.insert(done, at: 0)
@@ -188,7 +398,10 @@ final class Store: ObservableObject {
         dec.dateDecodingStrategy = .iso8601
         if let decoded = try? dec.decode(AppData.self, from: bytes) {
             data = decoded
-            selectedCategoryID = data.categories.first?.id
+            if data.selectedCategoryID == nil ||
+                !data.categories.contains(where: { $0.id == data.selectedCategoryID }) {
+                data.selectedCategoryID = data.categories.first?.id
+            }
             save()
         }
     }
@@ -234,7 +447,7 @@ struct RootView: View {
 
     var header: some View {
         HStack(spacing: 8) {
-            Picker("", selection: $store.selectedCategoryID) {
+            Picker("", selection: store.selectedCategoryBinding) {
                 ForEach(store.data.categories) { c in
                     Text(c.name).tag(Optional(c.id))
                 }
@@ -246,6 +459,8 @@ struct RootView: View {
 
             Button { showHistory.toggle() } label: {
                 Image(systemName: showHistory ? "list.bullet" : "clock.arrow.circlepath")
+                    .font(.system(size: 18, weight: .regular))
+                    .frame(width: 30, height: 30)
             }
             .buttonStyle(.borderless)
             .help(showHistory ? "Show queue" : "Show history")
@@ -271,6 +486,8 @@ struct RootView: View {
                 Button("Quit QueueDo") { NSApp.terminate(nil) }
             } label: {
                 Image(systemName: "ellipsis.circle")
+                    .font(.system(size: 20, weight: .regular))
+                    .frame(width: 30, height: 30)
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
@@ -370,14 +587,19 @@ struct QueueView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 8) {
                 TextField("Add task to \(category.name)…", text: $newTitle)
                     .textFieldStyle(.roundedBorder)
+                    .controlSize(.large)
                     .onSubmit(addTask)
-                Button(action: addTask) { Image(systemName: "plus") }
-                    .disabled(newTitle.trimmingCharacters(in: .whitespaces).isEmpty)
+                Button(action: addTask) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .semibold))
+                        .frame(width: 28, height: 28)
+                }
+                .disabled(newTitle.trimmingCharacters(in: .whitespaces).isEmpty)
             }
-            .padding(8)
+            .padding(10)
 
             if category.tasks.isEmpty {
                 VStack(spacing: 8) {
@@ -440,33 +662,47 @@ struct TaskRow: View {
                 Button(action: complete) {
                     Image(systemName: completeIcon)
                         .foregroundStyle(completeColor)
-                        .font(.title3)
+                        .font(.system(size: 22, weight: .regular))
+                        .frame(width: 28, height: 28)
                 }
                 .buttonStyle(.plain)
                 .disabled(!task.canComplete)
                 .help(task.canComplete ? "Mark complete" : "Complete subtasks first")
 
                 VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 6) {
+                    HStack(spacing: 8) {
                         Button(action: onToggleExpand) {
                             Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                                .font(.caption2)
+                                .font(.system(size: 13, weight: .semibold))
                                 .foregroundStyle(.secondary)
-                                .frame(width: 10)
+                                .frame(width: 16, height: 16)
                         }
                         .buttonStyle(.plain)
                         .help(isExpanded ? "Hide subtasks" : "Show subtasks")
 
                         Text(task.title)
+                            .font(.body)
                             .fontWeight(isTop ? .semibold : .regular)
                         if !task.subtasks.isEmpty {
                             let p = task.subtaskProgress
                             Text("\(p.done)/\(p.total)")
-                                .font(.caption2)
+                                .font(.caption)
                                 .foregroundStyle(.secondary)
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
                                 .background(Color.secondary.opacity(0.12), in: Capsule())
+                        }
+                        if let due = task.dueDate {
+                            HStack(spacing: 3) {
+                                Image(systemName: "calendar")
+                                    .font(.caption2)
+                                Text(dueChipText(due))
+                                    .font(.caption)
+                            }
+                            .foregroundStyle(dueColor(due))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 2)
+                            .background(dueColor(due).opacity(0.15), in: Capsule())
                         }
                     }
                     if !task.notes.isEmpty {
@@ -490,7 +726,10 @@ struct TaskRow: View {
                         store.removeTask(task.id, in: categoryID)
                     }
                 } label: {
-                    Image(systemName: "ellipsis").foregroundStyle(.secondary)
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 28, height: 28)
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
@@ -501,41 +740,49 @@ struct TaskRow: View {
             if isExpanded {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(task.subtasks) { sub in
-                        HStack(spacing: 6) {
+                        HStack(spacing: 8) {
                             Button {
                                 store.toggleSubtask(sub.id, in: task.id, categoryID: categoryID)
                             } label: {
                                 Image(systemName: sub.done ? "checkmark.square.fill" : "square")
+                                    .font(.system(size: 18, weight: .regular))
                                     .foregroundStyle(sub.done ? Color.accentColor : .secondary)
+                                    .frame(width: 24, height: 24)
                             }
                             .buttonStyle(.plain)
                             Text(sub.title)
+                                .font(.callout)
                                 .strikethrough(sub.done, color: .secondary)
                                 .foregroundStyle(sub.done ? .secondary : .primary)
                             Spacer()
                             Button {
                                 store.removeSubtask(sub.id, in: task.id, categoryID: categoryID)
                             } label: {
-                                Image(systemName: "minus.circle").foregroundStyle(.tertiary)
+                                Image(systemName: "minus.circle")
+                                    .font(.system(size: 16, weight: .regular))
+                                    .foregroundStyle(.tertiary)
+                                    .frame(width: 24, height: 24)
                             }
                             .buttonStyle(.plain)
                             .help("Remove subtask")
                         }
-                        .font(.caption)
                     }
-                    HStack(spacing: 6) {
-                        Image(systemName: "plus").font(.caption2).foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 24)
                         TextField("Add subtask…", text: $newSubtaskText)
                             .textFieldStyle(.plain)
-                            .font(.caption)
+                            .font(.callout)
                             .onSubmit(addSubtask)
                         if !newSubtaskText.trimmingCharacters(in: .whitespaces).isEmpty {
-                            Button("Add", action: addSubtask).buttonStyle(.borderless).font(.caption)
+                            Button("Add", action: addSubtask).buttonStyle(.borderless)
                         }
                     }
                 }
-                .padding(.leading, 28)
-                .padding(.top, 2)
+                .padding(.leading, 36)
+                .padding(.top, 4)
             }
         }
         .padding(.vertical, 2)
@@ -561,6 +808,31 @@ struct TaskRow: View {
         store.addSubtask(to: task.id, in: categoryID, title: t)
         newSubtaskText = ""
     }
+
+    private func dueChipText(_ d: Date) -> String {
+        let cal = Calendar.current
+        if cal.isDateInToday(d) {
+            return "Today " + d.formatted(date: .omitted, time: .shortened)
+        }
+        if cal.isDateInTomorrow(d) {
+            return "Tomorrow " + d.formatted(date: .omitted, time: .shortened)
+        }
+        let days = cal.dateComponents([.day], from: cal.startOfDay(for: Date()),
+                                      to: cal.startOfDay(for: d)).day ?? 0
+        if days < 0 {
+            return d.formatted(date: .abbreviated, time: .shortened)
+        }
+        if days <= 7 {
+            return d.formatted(.dateTime.weekday(.abbreviated).hour().minute())
+        }
+        return d.formatted(date: .abbreviated, time: .omitted)
+    }
+
+    private func dueColor(_ d: Date) -> Color {
+        if d < Date() { return .red }
+        if Calendar.current.isDateInToday(d) { return .orange }
+        return .secondary
+    }
 }
 
 struct EditTaskSheet: View {
@@ -568,14 +840,40 @@ struct EditTaskSheet: View {
     @Environment(\.dismiss) var dismiss
     var onSave: (TodoTask) -> Void
 
+    @State private var hasDueDate: Bool
+
+    init(task: TodoTask, onSave: @escaping (TodoTask) -> Void) {
+        _task = State(initialValue: task)
+        _hasDueDate = State(initialValue: task.dueDate != nil)
+        self.onSave = onSave
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             Text("Edit task").font(.headline)
             TextField("Title", text: $task.title).textFieldStyle(.roundedBorder)
+
+            Toggle("Has due date", isOn: $hasDueDate)
+                .onChange(of: hasDueDate) { _, newVal in
+                    if newVal && task.dueDate == nil {
+                        task.dueDate = nextDefaultDueDate()
+                    } else if !newVal {
+                        task.dueDate = nil
+                    }
+                }
+            if hasDueDate {
+                DatePicker("Due", selection: Binding(
+                    get: { task.dueDate ?? nextDefaultDueDate() },
+                    set: { task.dueDate = $0 }
+                ), displayedComponents: [.date, .hourAndMinute])
+                .datePickerStyle(.compact)
+            }
+
             Text("Notes").font(.caption).foregroundStyle(.secondary)
             TextEditor(text: $task.notes)
-                .frame(minHeight: 120)
+                .frame(minHeight: 100)
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3)))
+
             HStack {
                 Spacer()
                 Button("Cancel") { dismiss() }
@@ -584,7 +882,16 @@ struct EditTaskSheet: View {
             }
         }
         .padding()
-        .frame(width: 380)
+        .frame(width: 420)
+    }
+
+    private func nextDefaultDueDate() -> Date {
+        let cal = Calendar.current
+        var comps = cal.dateComponents([.year, .month, .day], from: Date())
+        comps.day! += 1
+        comps.hour = 9
+        comps.minute = 0
+        return cal.date(from: comps) ?? Date().addingTimeInterval(86400)
     }
 }
 
@@ -623,6 +930,226 @@ struct HistoryView: View {
     }
 }
 
+// MARK: - Kanban (window view)
+
+struct KanbanView: View {
+    @EnvironmentObject var store: Store
+    @State private var showAddCategory = false
+    @State private var newCategoryName = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text("QueueDo").font(.title3).fontWeight(.semibold)
+                Spacer()
+                Button {
+                    showAddCategory = true
+                } label: {
+                    Label("Add category", systemImage: "plus.rectangle.on.rectangle")
+                        .font(.system(size: 13, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+
+                Menu {
+                    Button("Export data…") { exportData() }
+                    Button("Import data…") { importData() }
+                    Button("Reveal data file in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([store.dataFileURL])
+                    }
+                    Divider()
+                    Button("Quit QueueDo") { NSApp.terminate(nil) }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 22))
+                        .frame(width: 34, height: 34)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+            .padding(12)
+
+            Divider()
+
+            if store.data.categories.isEmpty {
+                VStack(spacing: 10) {
+                    Text("No categories yet").foregroundStyle(.secondary)
+                    Button("Add category…") { showAddCategory = true }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView(.horizontal, showsIndicators: true) {
+                    HStack(alignment: .top, spacing: 12) {
+                        ForEach(store.data.categories) { cat in
+                            CategoryColumnView(category: cat)
+                                .frame(width: 340)
+                        }
+                    }
+                    .padding(12)
+                }
+            }
+        }
+        .sheet(isPresented: $showAddCategory) {
+            AddCategorySheet(name: $newCategoryName) { name in
+                let t = name.trimmingCharacters(in: .whitespaces)
+                if !t.isEmpty { store.addCategory(name: t) }
+                newCategoryName = ""
+            }
+        }
+    }
+
+    func exportData() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "queuedo-export.json"
+        if panel.runModal() == .OK, let url = panel.url {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.copyItem(at: store.dataFileURL, to: url)
+        }
+    }
+    func importData() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            store.importJSON(from: url)
+        }
+    }
+}
+
+struct CategoryColumnView: View {
+    @EnvironmentObject var store: Store
+    let category: Category
+    @State private var newTitle = ""
+    @State private var showHistory = false
+    @State private var editingTask: TodoTask? = nil
+    @State private var expandedTaskIDs: Set<UUID> = []
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack(spacing: 6) {
+                Text(category.name).font(.headline)
+                Text("\(category.tasks.count)")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Color.secondary.opacity(0.15), in: Capsule())
+                Spacer()
+                Button { showHistory.toggle() } label: {
+                    Image(systemName: showHistory ? "list.bullet" : "clock.arrow.circlepath")
+                        .font(.system(size: 16))
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.borderless)
+                .help(showHistory ? "Show queue" : "Show history")
+
+                Menu {
+                    Button("Rename…") { renameColumn() }
+                    Button("Delete category", role: .destructive) { confirmDelete() }
+                    Divider()
+                    Button("Clear history", role: .destructive) {
+                        store.clearHistory(in: category.id)
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 16, weight: .semibold))
+                        .frame(width: 28, height: 28)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+            .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 6)
+
+            // Add task field
+            HStack(spacing: 8) {
+                TextField("Add task…", text: $newTitle)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.large)
+                    .onSubmit(addTask)
+                Button(action: addTask) {
+                    Image(systemName: "plus")
+                        .font(.system(size: 14, weight: .semibold))
+                        .frame(width: 26, height: 26)
+                }
+                .disabled(newTitle.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .padding(.horizontal, 12).padding(.bottom, 8)
+
+            Divider()
+
+            // Body
+            if showHistory {
+                HistoryView(category: category)
+            } else if category.tasks.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "tray").font(.title2).foregroundStyle(.tertiary)
+                    Text("Empty").font(.caption).foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.vertical, 30)
+            } else {
+                List {
+                    ForEach(Array(category.tasks.enumerated()), id: \.element.id) { idx, task in
+                        TaskRow(categoryID: category.id,
+                                task: task,
+                                isTop: idx == 0,
+                                isExpanded: expandedTaskIDs.contains(task.id),
+                                onToggleExpand: { toggleExpand(task.id) },
+                                onEdit: { editingTask = task })
+                    }
+                    .onMove { src, dst in
+                        store.moveTasks(in: category.id, from: src, to: dst)
+                    }
+                }
+                .listStyle(.plain)
+                .scrollContentBackground(.hidden)
+            }
+        }
+        .frame(maxHeight: .infinity)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .sheet(item: $editingTask) { task in
+            EditTaskSheet(task: task) { updated in
+                store.updateTask(updated, in: category.id)
+            }
+        }
+    }
+
+    func addTask() {
+        let t = newTitle.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty else { return }
+        store.addTask(to: category.id, title: t, notes: "")
+        newTitle = ""
+    }
+    func toggleExpand(_ id: UUID) {
+        if expandedTaskIDs.contains(id) { expandedTaskIDs.remove(id) }
+        else { expandedTaskIDs.insert(id) }
+    }
+    func renameColumn() {
+        let alert = NSAlert()
+        alert.messageText = "Rename category"
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let tf = NSTextField(string: category.name)
+        tf.frame = NSRect(x: 0, y: 0, width: 240, height: 24)
+        alert.accessoryView = tf
+        if alert.runModal() == .alertFirstButtonReturn {
+            let v = tf.stringValue.trimmingCharacters(in: .whitespaces)
+            if !v.isEmpty { store.renameCategory(category.id, to: v) }
+        }
+    }
+    func confirmDelete() {
+        let alert = NSAlert()
+        alert.messageText = "Delete \"\(category.name)\"?"
+        alert.informativeText = "All open and completed tasks in this category will be removed."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            store.deleteCategory(category.id)
+        }
+    }
+}
+
 // MARK: - App
 
 @MainActor
@@ -635,15 +1162,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
 
-        // Main window
+        // Request Calendar + Reminders access in the background
+        Task { await CalendarSync.shared.requestPermissions() }
+
+        // Main window (kanban view)
         let rootHost = NSHostingController(
-            rootView: RootView()
+            rootView: KanbanView()
                 .environmentObject(store)
-                .frame(minWidth: 380, minHeight: 520)
+                .frame(minWidth: 480, minHeight: 520)
         )
         mainWindow = NSWindow(contentViewController: rootHost)
         mainWindow.title = "QueueDo"
-        mainWindow.setContentSize(NSSize(width: 420, height: 560))
+        mainWindow.setContentSize(NSSize(width: 1100, height: 650))
         mainWindow.styleMask = [.titled, .closable, .miniaturizable, .resizable]
         mainWindow.isReleasedWhenClosed = false
         mainWindow.center()

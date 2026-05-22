@@ -43,8 +43,12 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleShortVersionString</key><string>1.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>LSMinimumSystemVersion</key><string>13.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
+  <key>NSCalendarsUsageDescription</key><string>QueueDo creates calendar events for tasks with due dates.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key><string>QueueDo creates calendar events for tasks with due dates.</string>
+  <key>NSRemindersUsageDescription</key><string>QueueDo creates reminders for your tasks.</string>
+  <key>NSRemindersFullAccessUsageDescription</key><string>QueueDo creates reminders for your tasks.</string>
   ${ICON_KEY}
 </dict>
 </plist>
@@ -52,7 +56,8 @@ EOF
 
 swiftc -O \
   -parse-as-library \
-  -target arm64-apple-macos13 \
+  -target arm64-apple-macos14 \
+  -framework EventKit \
   -o "$MACOS_DIR/QueueDo" \
   "$DIR/Sources/main.swift"
 
