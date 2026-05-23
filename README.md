@@ -1,5 +1,5 @@
 # QueueDo 📅✅
-
+## NOTE: THE POINT OF THIS REPO IS TO TEST DEVELOPMENT WITH DIFFERENT AGENTIC FRAMEWORKS THROUGH THE DEVELOPMENT OF A TO-DO APP THAT I HAVE ALWAYS INVISIONED. MOST OF THIS IS AI GENERATED INCLUDING THE README.MD, I NEVER INTEND TO DECEIVE
 QueueDo is a lightweight, elegant task management application for macOS that blends a Kanban-style overview with a quick-access menu bar popover. It focuses on "getting things out of your head" and into a structured queue, with automatic synchronization to macOS Calendar and Reminders.
 
 ## ✨ Features
