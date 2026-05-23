@@ -59,7 +59,7 @@ swiftc -O \
   -target arm64-apple-macos14 \
   -framework EventKit \
   -o "$MACOS_DIR/QueueDo" \
-  "$DIR/Sources/main.swift"
+  $(find "$DIR/Sources" -name "*.swift")
 
 # Ad-hoc sign so macOS treats it as a stable identity
 codesign --force --sign - "$APP_BUNDLE" >/dev/null 2>&1 || true
